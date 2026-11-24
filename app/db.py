@@ -20,9 +20,11 @@ engine = create_engine(DATABASE_URL, connect_args=connect_args)
 
 
 @event.listens_for(engine, "connect")
-def _sqlite_pragma(dbapi_conn, _):  # 开启外键约束
+def _sqlite_pragma(dbapi_conn, _):  # 开启外键约束;WAL 让只读调查与发布互不阻塞
     try:
         dbapi_conn.execute("PRAGMA foreign_keys=ON")
+        dbapi_conn.execute("PRAGMA journal_mode=WAL")
+        dbapi_conn.execute("PRAGMA busy_timeout=5000")
     except Exception:
         pass
 

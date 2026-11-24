@@ -36,3 +36,34 @@ curl -sS "$BASE/workstations/WS-01/spec"
 echo
 curl -sS "$BASE/workstations/WS-02/spec"
 echo
+
+echo; echo "== 6. 误发批次:把 WS-02(旧终端)升级为新终端 =="
+BATCH3=$(curl -sS -X POST "$BASE/batches" -H 'Content-Type: application/json' -d '{
+  "title": "误发:WS-02 升级新终端",
+  "ops": [{"op": "upsert_workstation", "workstation_code": "WS-02", "name": "二号车床", "terminal_generation": "new"}]}')
+BID3=$(echo "$BATCH3" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+curl -sS -X POST "$BASE/batches/$BID3/verify" > /dev/null
+curl -sS -X POST "$BASE/batches/$BID3/publish"
+echo
+
+echo; echo "== 7. 后续批次:WS-02 领用非对称项目 ITEM-LEN-120(已是新终端,合法)=="
+BATCH4=$(curl -sS -X POST "$BASE/batches" -H 'Content-Type: application/json' -d '{
+  "title": "WS-02 领用非对称项目",
+  "ops": [{"op": "claim_item", "workstation_code": "WS-02", "item_code": "ITEM-LEN-120"}]}')
+BID4=$(echo "$BATCH4" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+curl -sS -X POST "$BASE/batches/$BID4/verify" > /dev/null
+curl -sS -X POST "$BASE/batches/$BID4/publish"
+echo
+
+echo; echo "== 8. 后续批次:ITEM-DIA-40 收紧为 ±10µm =="
+BATCH5=$(curl -sS -X POST "$BASE/batches" -H 'Content-Type: application/json' -d '{
+  "title": "ITEM-DIA-40 收紧公差",
+  "ops": [{"op": "upsert_item", "item_code": "ITEM-DIA-40", "name": "主轴孔直径", "nominal_um": 40000, "upper_um": 40010, "lower_um": 39990}]}')
+BID5=$(echo "$BATCH5" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+curl -sS -X POST "$BASE/batches/$BID5/verify" > /dev/null
+curl -sS -X POST "$BASE/batches/$BID5/publish"
+echo
+
+echo; echo "== 9. 只读调查:假设少了第 $BID3 批(误发的升级),后续哪些批次会失败、下发规范怎么变 =="
+echo "   (批次 $BID4 回放时 WS-02 仍是旧终端 → 领用非对称项目违规,整批丢弃;批次 $BID5 继续重放)"
+curl -sS "$BASE/batches/$BID3/investigate" | python3 -m json.tool

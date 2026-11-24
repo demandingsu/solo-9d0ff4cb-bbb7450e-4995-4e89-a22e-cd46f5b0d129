@@ -5,6 +5,8 @@
 - 所有修改都走「批次」:规范与工位配置可同批修改,先核对(verify)再发布(publish)。
 - 核对后若所涉规范/工位配置/领用变过(即使改回原样),发布会被拒绝,需重新核对;无关改动不影响发布。
 - 按工位取数:GET /workstations/{code}/spec 每次返回一整份生效的下发规范。
+- 只读调查:GET /batches/{id}/investigate 假设少了某已发布批次,重放后续批次,
+  找出会失败的批次与各工位下发规范的变化(发布时已保存回放依据)。
 """
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ import hashlib
 import json
 
 from fastapi import Depends, FastAPI, HTTPException
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
 from . import models, schemas, services
@@ -20,6 +22,22 @@ from .db import Base, engine, get_session
 from .models import Batch, BatchOp, Claim, Item, Workstation, utcnow
 
 Base.metadata.create_all(engine)
+
+
+def _migrate() -> None:
+    """轻量迁移:为既有数据库补充新列。
+
+    早期发布的批次 replay_basis 为 NULL,调查时提示无法调查。
+    """
+    insp = inspect(engine)
+    if "batches" in insp.get_table_names():
+        cols = {c["name"] for c in insp.get_columns("batches")}
+        if "replay_basis" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE batches ADD COLUMN replay_basis JSON"))
+
+
+_migrate()
 
 app = FastAPI(
     title="机床工位量检规范下发 API",
@@ -224,6 +242,8 @@ def publish_batch(batch_id: int, session: Session = Depends(get_session)):
                 },
             )
         changes = services.diff_states(state, sim)
+        # 回放依据(发布前生效状态快照)与发布同事务落库:保存失败则整体回滚、不生效
+        batch.replay_basis = services.build_replay_basis(state)
         enriched = services.apply_changes(session, changes, sim)
         batch.status = "published"
         batch.published_at = utcnow()
@@ -235,6 +255,65 @@ def publish_batch(batch_id: int, session: Session = Depends(get_session)):
             "published_at": batch.published_at,
             "changes": enriched,
         }
+
+
+# ---------------------------------------------------------------- 调查(只读)
+
+
+@app.get(
+    "/batches/{batch_id}/investigate",
+    response_model=schemas.InvestigateResponse,
+    tags=["调查"],
+)
+def investigate_batch(batch_id: int, session: Session = Depends(get_session)):
+    """只读调查:假设少了该批,后续哪些批次会失败、各工位下发规范怎么变。
+
+    从该批发布时保存的回放依据(发布前生效状态)出发,跳过该批,按实际发布顺序
+    重放后续批次的原操作;引用不存在的项目/工位、或整批应用后违反旧终端公差规则
+    的批次,列出批次号与原因并丢弃其全部改动,再继续。最后列出下发规范有变化的
+    工位及两边内容(工位只在一边存在也列出;生成时间不参与比较)。
+
+    本请求为只读:回放的批次范围与对照用的实际下发规范在同一已提交时点读取
+    (单一读事务快照),回放期间可正常发布。早期批次缺少回放依据时无法调查。
+    """
+    batch = _get_batch(session, batch_id)
+    if batch.status != "published":
+        raise HTTPException(
+            409,
+            detail={"error": "batch_not_published", "message": "仅已发布的批次可调查"},
+        )
+    if not batch.replay_basis:
+        raise HTTPException(
+            409,
+            detail={
+                "error": "replay_basis_missing",
+                "message": "该批次发布时未保存回放依据(早期数据),无法调查",
+            },
+        )
+    # 同一已提交时点:后续已发布批次(回放范围)+ 当前生效状态(对照),
+    # 两者在同一读事务快照内取出;之后为纯内存计算,不再触碰数据库。
+    subsequent = session.scalars(
+        select(Batch)
+        .where(Batch.status == "published")
+        .where(
+            (Batch.published_at > batch.published_at)
+            | ((Batch.published_at == batch.published_at) & (Batch.id > batch.id))
+        )
+        .order_by(Batch.published_at, Batch.id)
+    ).all()
+    actual_state = services.load_state(session)
+
+    replay_state = services.state_from_basis(batch.replay_basis)
+    replay_state, failed = services.replay_batches(replay_state, subsequent)
+    diffs = services.diff_issued_specs(actual_state, replay_state)
+    return {
+        "batch_id": batch.id,
+        "title": batch.title,
+        "published_at": batch.published_at,
+        "replayed_batches": [b.id for b in subsequent],
+        "failed_batches": failed,
+        "spec_diffs": diffs,
+    }
 
 
 # ---------------------------------------------------------------- 检验项目

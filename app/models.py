@@ -78,6 +78,9 @@ class Batch(Base):
     status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
     violations: Mapped[list | None] = mapped_column(JSON, nullable=True)
     fingerprint: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 回放依据:发布时同事务保存的「发布前生效状态快照」,供只读调查重放后续批次;
+    # 保存失败则发布整体回滚。早期批次无此字段(NULL)→ 无法调查。
+    replay_basis: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

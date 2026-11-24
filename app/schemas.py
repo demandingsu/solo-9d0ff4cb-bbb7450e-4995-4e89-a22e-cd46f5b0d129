@@ -131,6 +131,7 @@ class BatchOut(BaseModel):
     ops: list[dict[str, Any]]
     violations: list[Violation] | None
     involved: dict[str, list[str]] | None  # 核对指纹记录的所涉实体
+    replay_basis_available: bool  # 是否已保存回放依据(旧批次为 False,无法调查)
     created_at: datetime
     verified_at: datetime | None
     published_at: datetime | None
@@ -203,3 +204,45 @@ class WorkstationSpecOut(BaseModel):
     revision: str
     generated_at: datetime
     items: list[SpecItemNew | SpecItemOld]
+
+
+# ---------------------------------------------------------------- 调查(只读)
+
+
+class SpecSnapshot(BaseModel):
+    """一整份下发规范的对比快照:与下发格式一致,但不含生成时间(不参与比较)。"""
+
+    workstation_code: str
+    workstation_name: str
+    terminal_generation: str
+    items: list[SpecItemNew | SpecItemOld]
+
+
+class WorkstationSpecDiff(BaseModel):
+    """某工位两边的下发规范对比;工位只在一边存在时另一边为 null。"""
+
+    workstation_code: str
+    actual: SpecSnapshot | None  # 实际当前下发(含被调查批次)
+    without_batch: SpecSnapshot | None  # 假设少了该批、重放后续批次后的下发
+
+
+class ReplayFailure(BaseModel):
+    """回放中无法应用、被整体丢弃的批次及原因。"""
+
+    batch_id: int
+    title: str
+    published_at: datetime | None
+    reason: str  # op_error | asymmetric_tolerance_on_old_terminal
+    message: str
+    violations: list[Violation] | None
+
+
+class InvestigateResponse(BaseModel):
+    """只读调查结果:假设少了该批,后续哪些批次会失败、各工位下发规范怎么变。"""
+
+    batch_id: int
+    title: str
+    published_at: datetime
+    replayed_batches: list[int]  # 参与回放的后续批次(按实际发布顺序)
+    failed_batches: list[ReplayFailure]  # 回放失败、改动被丢弃的批次
+    spec_diffs: list[WorkstationSpecDiff]  # 下发规范有变化的工位及两边内容

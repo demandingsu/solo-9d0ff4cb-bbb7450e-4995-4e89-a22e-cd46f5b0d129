@@ -350,6 +350,157 @@ def apply_changes(session: Session, changes: list[dict], sim: State) -> list[dic
     return enriched
 
 
+# ---------------------------------------------------------------- 回放依据与调查
+
+REPLAY_BASIS_VERSION = 1
+
+
+def build_replay_basis(state: State) -> dict:
+    """发布前生效状态快照,作为「跳过本批重放后续批次」的调查依据。
+
+    发布时与同事务落库:保存失败则发布整体回滚、不生效。
+    """
+    return {
+        "version": REPLAY_BASIS_VERSION,
+        "state": {
+            "items": [
+                {
+                    "code": it.code,
+                    "name": it.name,
+                    "nominal_um": it.nominal_um,
+                    "upper_um": it.upper_um,
+                    "lower_um": it.lower_um,
+                }
+                for it in sorted(state.items.values(), key=lambda x: x.code)
+            ],
+            "workstations": [
+                {
+                    "code": ws.code,
+                    "name": ws.name,
+                    "terminal_generation": ws.terminal_generation,
+                }
+                for ws in sorted(state.workstations.values(), key=lambda x: x.code)
+            ],
+            "claims": [
+                {"workstation_code": ws_code, "item_code": item_code}
+                for ws_code, item_code in sorted(state.claims)
+            ],
+        },
+    }
+
+
+def state_from_basis(basis: dict) -> State:
+    """从回放依据还原生效状态(版本号不参与回放,取默认值)。"""
+    s = basis["state"]
+    items = {
+        it["code"]: ItemState(
+            it["code"], it["name"], it["nominal_um"], it["upper_um"], it["lower_um"]
+        )
+        for it in s["items"]
+    }
+    workstations = {
+        ws["code"]: WorkstationState(ws["code"], ws["name"], ws["terminal_generation"])
+        for ws in s["workstations"]
+    }
+    claims = {(c["workstation_code"], c["item_code"]) for c in s["claims"]}
+    return State(items, workstations, claims)
+
+
+def replay_batches(start: State, batches: list[Batch]) -> tuple[State, list[dict]]:
+    """从起始状态出发,按给定顺序(实际发布顺序)重放各批次的原操作。
+
+    某批操作引用了不存在的项目/工位,或整批应用后违反旧终端公差规则:
+    记录批次号与原因,丢弃该批全部改动,再继续下一批。
+    """
+    state = start
+    failed: list[dict] = []
+    for batch in batches:
+        ops = [op.payload for op in batch.ops]
+        try:
+            sim = simulate(state, ops)
+        except OpError as exc:
+            failed.append(
+                {
+                    "batch_id": batch.id,
+                    "title": batch.title,
+                    "published_at": batch.published_at,
+                    "reason": "op_error",
+                    "message": str(exc),
+                    "violations": None,
+                }
+            )
+            continue
+        violations = find_violations(sim)
+        if violations:
+            failed.append(
+                {
+                    "batch_id": batch.id,
+                    "title": batch.title,
+                    "published_at": batch.published_at,
+                    "reason": "asymmetric_tolerance_on_old_terminal",
+                    "message": "整批应用后仍有旧终端领用非对称公差,该批改动已整体丢弃",
+                    "violations": violations,
+                }
+            )
+            continue
+        state = sim
+    return state, failed
+
+
+def issued_spec(state: State, ws_code: str) -> dict | None:
+    """某状态下某工位的一整份下发规范(与下发格式一致,不含生成时间)。
+
+    工位在该状态不存在时返回 None。
+    """
+    ws = state.workstations.get(ws_code)
+    if ws is None:
+        return None
+    items = []
+    for w, i in sorted(state.claims):
+        if w != ws_code:
+            continue
+        it = state.items[i]
+        if ws.terminal_generation == "old":
+            items.append(
+                {
+                    "item_code": i,
+                    "name": it.name,
+                    "nominal_um": it.nominal_um,
+                    "tolerance_um": it.upper_um - it.nominal_um,
+                }
+            )
+        else:
+            items.append(
+                {
+                    "item_code": i,
+                    "name": it.name,
+                    "nominal_um": it.nominal_um,
+                    "upper_um": it.upper_um,
+                    "lower_um": it.lower_um,
+                }
+            )
+    return {
+        "workstation_code": ws.code,
+        "workstation_name": ws.name,
+        "terminal_generation": ws.terminal_generation,
+        "items": items,
+    }
+
+
+def diff_issued_specs(actual: State, replayed: State) -> list[dict]:
+    """对比两个状态下各工位的整份下发规范,列出有变化的工位及两边内容。
+
+    工位只在一边存在时另一边为 None;生成时间不参与比较(快照本就不含)。
+    """
+    diffs: list[dict] = []
+    for code in sorted(set(actual.workstations) | set(replayed.workstations)):
+        a = issued_spec(actual, code)
+        b = issued_spec(replayed, code)
+        if a != b:
+            diffs.append({"workstation_code": code, "actual": a, "without_batch": b})
+    return diffs
+
+
 # ---------------------------------------------------------------- 批次序列化
 
 
@@ -367,6 +518,7 @@ def batch_to_out(batch: Batch) -> dict:
         "ops": [op.payload for op in batch.ops],
         "violations": batch.violations,
         "involved": involved,
+        "replay_basis_available": batch.replay_basis is not None,
         "created_at": batch.created_at,
         "verified_at": batch.verified_at,
         "published_at": batch.published_at,
